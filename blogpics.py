@@ -178,7 +178,8 @@ def resize_and_save(src_path: str) -> str:
 IMAGE_EXTS = {".jpg", ".jpeg", ".heic", ".png", ".tiff", ".tif"}
 
 
-def process_day(target_date: date, photosdb: osxphotos.PhotosDB, force: bool = False):
+def process_day(target_date: date, photosdb: osxphotos.PhotosDB, force: bool = False) -> dict:
+    """Returns a summary dict with keys: date, uploaded, skipped, failed, post_id."""
     print(f"\n{'='*52}")
     print(f"  {target_date.strftime('%Y-%m-%d')}")
     print(f"{'='*52}")
@@ -208,83 +209,105 @@ def process_day(target_date: date, photosdb: osxphotos.PhotosDB, force: bool = F
 
     if not photos:
         print("  No photos found — skipping.")
-        return
+        return {"date": target_date, "uploaded": 0, "skipped": 0, "failed": [], "post_id": None}
 
     print(f"  Found {len(photos)} photo(s)")
+
+    skipped  = []   # already done in a prior run
+    uploaded = []   # succeeded this run
+    failed   = []   # failed this run
 
     with tempfile.TemporaryDirectory() as tmpdir:
         for i, photo in enumerate(photos, 1):
             time_str = photo.date.strftime("%H:%M:%S")
             uuid = photo.uuid
 
-            # Already uploaded in a previous run — skip the upload
             if uuid in already_done:
-                print(f"  [{i:>3}/{len(photos)}] {photo.original_filename}  ({time_str})  — already uploaded, skipping")
+                print(f"  [{i:>3}/{len(photos)}] {photo.original_filename}  ({time_str})  — skipping (already uploaded)")
+                skipped.append(photo.original_filename)
                 continue
 
             print(f"  [{i:>3}/{len(photos)}] {photo.original_filename}  ({time_str})", end="", flush=True)
 
+            fail_reason = None
+
             try:
                 exported = photo.export(tmpdir, overwrite=True, use_photos_export=False)
                 if not exported:
-                    # File not local — ask Photos app to download from iCloud
                     print("  (fetching from iCloud…)", end="", flush=True)
-                    exported = photo.export(tmpdir, overwrite=True, use_photos_export=True)
+                    try:
+                        exported = photo.export(tmpdir, overwrite=True, use_photos_export=True)
+                    except Exception as e:
+                        fail_reason = f"iCloud export failed: {e}"
             except Exception as e:
-                print(f"  ✗ export failed: {e}")
-                continue
+                fail_reason = f"export failed: {e}"
 
-            if not exported:
-                print("  ✗ could not retrieve (skipped)")
-                continue
+            if not fail_reason and not exported:
+                fail_reason = "could not retrieve from iCloud"
 
-            exported = [f for f in exported if Path(f).suffix.lower() in IMAGE_EXTS]
-            if not exported:
-                print("  ✗ no image file in export (skipped)")
-                continue
+            if not fail_reason:
+                image_files = [f for f in exported if Path(f).suffix.lower() in IMAGE_EXTS]
+                if not image_files:
+                    fail_reason = "no image file in export"
 
-            try:
-                resized = resize_and_save(exported[0])
-            except Exception as e:
-                print(f"  ✗ resize failed: {e}")
-                continue
+            if not fail_reason:
+                try:
+                    resized = resize_and_save(image_files[0])
+                except Exception as e:
+                    fail_reason = f"resize failed: {e}"
+                    resized = None
 
-            try:
-                filename = f"{target_date.strftime('%Y%m%d')}_{i:03d}.jpg"
-                att_id, att_url = upload_image(resized, filename)
-                # Save state immediately after each successful upload
-                state["photos"][uuid] = {"id": att_id, "url": att_url}
-                save_state(target_date, state)
-                print(f"  ✓  id={att_id}")
-            except requests.HTTPError as e:
-                print(f"  ✗ upload failed: {e.response.status_code} {e.response.text[:120]}")
-            finally:
-                os.unlink(resized)
+            if not fail_reason:
+                try:
+                    filename = f"{target_date.strftime('%Y%m%d')}_{i:03d}.jpg"
+                    att_id, att_url = upload_image(resized, filename)
+                    state["photos"][uuid] = {"id": att_id, "url": att_url}
+                    save_state(target_date, state)
+                    uploaded.append(photo.original_filename)
+                    print(f"  ✓  id={att_id}")
+                except Exception as e:
+                    fail_reason = f"upload failed: {e}"
+                finally:
+                    if resized and os.path.exists(resized):
+                        os.unlink(resized)
 
-    # Build blocks in original photo order (preserves chronological sort)
-    uuid_to_entry = state["photos"]
+            if fail_reason:
+                print(f"  ✗ {fail_reason}")
+                failed.append((photo.original_filename, fail_reason))
+
+    # Build blocks in original photo order
     blocks = []
     for photo in photos:
-        entry = uuid_to_entry.get(photo.uuid)
+        entry = state["photos"].get(photo.uuid)
         if entry:
             blocks.append(gallery_block(entry["id"], entry["url"]))
 
+    # Summary
+    print(f"\n  Results: {len(uploaded)} uploaded, {len(skipped)} skipped, {len(failed)} failed")
+    if failed:
+        print("  Failed photos:")
+        for name, reason in failed:
+            print(f"    ✗ {name}: {reason}")
+
     if not blocks:
-        print("  No images uploaded — skipping post creation.")
-        return
+        print("  No images to post — skipping post creation.")
+        return {"date": target_date, "uploaded": len(uploaded), "skipped": len(skipped), "failed": failed, "post_id": None}
 
     try:
         if state["post_id"]:
             edit_url = update_draft(state["post_id"], blocks)
-            print(f"\n  Draft updated ({len(blocks)} image(s))")
+            print(f"  Draft updated ({len(blocks)} image(s))")
         else:
             post_id, edit_url = create_draft(blocks, target_date)
             state["post_id"] = post_id
             save_state(target_date, state)
-            print(f"\n  Draft created ({len(blocks)} image(s))")
+            print(f"  Draft created ({len(blocks)} image(s))")
         print(f"  Edit here: {edit_url}")
-    except requests.HTTPError as e:
-        print(f"  ✗ post creation failed: {e.response.status_code} {e.response.text[:200]}")
+    except Exception as e:
+        print(f"  ✗ post save failed: {e}")
+        print("  Uploaded images are saved — re-run without --force to retry the post.")
+
+    return {"date": target_date, "uploaded": len(uploaded), "skipped": len(skipped), "failed": failed, "post_id": state["post_id"]}
 
 
 def main():
@@ -315,10 +338,26 @@ def main():
     print("Loading Photos library (this may take a moment)…")
     photosdb = osxphotos.PhotosDB()
 
+    summaries = []
     current = start_date
     while current <= end_date:
-        process_day(current, photosdb, force=force)
+        result = process_day(current, photosdb, force=force)
+        if result:
+            summaries.append(result)
         current += timedelta(days=1)
+
+    if len(summaries) > 1:
+        print(f"\n{'='*52}")
+        print("  OVERALL SUMMARY")
+        print(f"{'='*52}")
+        total_up = total_sk = total_fa = 0
+        for s in summaries:
+            status = "ok" if not s["failed"] else f"{len(s['failed'])} failed"
+            print(f"  {s['date']}  uploaded={s['uploaded']}  skipped={s['skipped']}  [{status}]")
+            total_up += s["uploaded"]
+            total_sk += s["skipped"]
+            total_fa += len(s["failed"])
+        print(f"\n  Total: {total_up} uploaded, {total_sk} skipped, {total_fa} failed across {len(summaries)} day(s)")
 
     print("\nAll done.")
 
