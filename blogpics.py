@@ -9,10 +9,14 @@ Usage:
 Photos are inserted in chronological order (earliest first).
 Each photo gets its own Gutenberg gallery block.
 Post is created as a draft, dated to the photo date, with a blank title.
+
+Restartable: state is saved to state/YYYY-MM-DD.json after each upload.
+Re-running the same date skips already-uploaded photos and updates the post.
 """
 
 import sys
 import os
+import json
 import tempfile
 import base64
 from datetime import datetime, timedelta, date
@@ -36,6 +40,34 @@ WP_USER      = os.getenv("WP_USER")
 WP_PASS      = os.getenv("WP_APP_PASSWORD")
 MAX_WIDTH    = 2048
 JPEG_QUALITY = 85
+STATE_DIR    = Path(__file__).parent / "state"
+
+
+# ---------------------------------------------------------------------------
+# State helpers  (state/YYYY-MM-DD.json)
+# ---------------------------------------------------------------------------
+# Schema:
+#   {
+#     "post_id": 123 | null,
+#     "photos": {
+#       "<photo_uuid>": {"id": 456, "url": "https://..."}
+#     }
+#   }
+
+def state_path(target_date: date) -> Path:
+    STATE_DIR.mkdir(exist_ok=True)
+    return STATE_DIR / f"{target_date.strftime('%Y-%m-%d')}.json"
+
+
+def load_state(target_date: date) -> dict:
+    p = state_path(target_date)
+    if p.exists():
+        return json.loads(p.read_text())
+    return {"post_id": None, "photos": {}}
+
+
+def save_state(target_date: date, state: dict):
+    state_path(target_date).write_text(json.dumps(state, indent=2))
 
 
 # ---------------------------------------------------------------------------
@@ -64,26 +96,31 @@ def upload_image(file_path: str, filename: str) -> tuple[int, str]:
 
 
 def create_draft(blocks: list[str], post_date: date) -> tuple[int, str]:
-    """Create a draft post containing the given Gutenberg blocks.
-    Returns (post_id, edit_url).
-    """
-    content  = "\n\n".join(blocks)
+    """Create a new draft post. Returns (post_id, edit_url)."""
     date_str = datetime(post_date.year, post_date.month, post_date.day, 12, 0, 0).strftime(
         "%Y-%m-%dT%H:%M:%S"
     )
     payload = {
         "title":   "",
-        "content": content,
+        "content": "\n\n".join(blocks),
         "status":  "draft",
         "date":    date_str,
     }
     headers = {**auth_headers(), "Content-Type": "application/json"}
     resp = requests.post(f"{WP_BASE}/wp-json/wp/v2/posts", headers=headers, json=payload)
     resp.raise_for_status()
-    data    = resp.json()
+    data = resp.json()
     post_id = data["id"]
-    edit_url = f"{WP_BASE}/wp-admin/post.php?post={post_id}&action=edit"
-    return post_id, edit_url
+    return post_id, f"{WP_BASE}/wp-admin/post.php?post={post_id}&action=edit"
+
+
+def update_draft(post_id: int, blocks: list[str]) -> str:
+    """Update an existing draft post with new content. Returns edit_url."""
+    payload = {"content": "\n\n".join(blocks)}
+    headers = {**auth_headers(), "Content-Type": "application/json"}
+    resp = requests.post(f"{WP_BASE}/wp-json/wp/v2/posts/{post_id}", headers=headers, json=payload)
+    resp.raise_for_status()
+    return f"{WP_BASE}/wp-admin/post.php?post={post_id}&action=edit"
 
 
 def gallery_block(attachment_id: int, image_url: str) -> str:
@@ -113,7 +150,7 @@ def resize_and_save(src_path: str) -> str:
     Returns the temp file path — caller must delete it.
     """
     img = Image.open(src_path)
-    img = ImageOps.exif_transpose(img)   # fix phone rotation
+    img = ImageOps.exif_transpose(img)
     if img.mode not in ("RGB", "L"):
         img = img.convert("RGB")
     if img.width > MAX_WIDTH:
@@ -128,16 +165,24 @@ def resize_and_save(src_path: str) -> str:
 # Core logic
 # ---------------------------------------------------------------------------
 
+IMAGE_EXTS = {".jpg", ".jpeg", ".heic", ".png", ".tiff", ".tif"}
+
+
 def process_day(target_date: date, photosdb: osxphotos.PhotosDB):
     print(f"\n{'='*52}")
     print(f"  {target_date.strftime('%Y-%m-%d')}")
     print(f"{'='*52}")
 
+    state = load_state(target_date)
+    already_done = state["photos"]
+    if already_done:
+        print(f"  Resuming — {len(already_done)} photo(s) already uploaded")
+
     start  = datetime(target_date.year, target_date.month, target_date.day,  0,  0,  0)
     end    = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
     photos = photosdb.photos(from_date=start, to_date=end)
     photos = [p for p in photos if not p.hidden and not p.intrash and not p.ismovie]
-    photos.sort(key=lambda p: p.date)   # chronological — earliest first
+    photos.sort(key=lambda p: p.date)
 
     if not photos:
         print("  No photos found — skipping.")
@@ -145,10 +190,16 @@ def process_day(target_date: date, photosdb: osxphotos.PhotosDB):
 
     print(f"  Found {len(photos)} photo(s)")
 
-    blocks = []
     with tempfile.TemporaryDirectory() as tmpdir:
         for i, photo in enumerate(photos, 1):
             time_str = photo.date.strftime("%H:%M:%S")
+            uuid = photo.uuid
+
+            # Already uploaded in a previous run — skip the upload
+            if uuid in already_done:
+                print(f"  [{i:>3}/{len(photos)}] {photo.original_filename}  ({time_str})  — already uploaded, skipping")
+                continue
+
             print(f"  [{i:>3}/{len(photos)}] {photo.original_filename}  ({time_str})", end="", flush=True)
 
             try:
@@ -161,9 +212,7 @@ def process_day(target_date: date, photosdb: osxphotos.PhotosDB):
                 print("  ✗ nothing exported (possibly still in iCloud — download it first)")
                 continue
 
-            # skip any non-image files (e.g. .mov from live photos)
-            image_exts = {".jpg", ".jpeg", ".heic", ".png", ".tiff", ".tif"}
-            exported = [f for f in exported if Path(f).suffix.lower() in image_exts]
+            exported = [f for f in exported if Path(f).suffix.lower() in IMAGE_EXTS]
             if not exported:
                 print("  ✗ no image file in export (skipped)")
                 continue
@@ -175,22 +224,38 @@ def process_day(target_date: date, photosdb: osxphotos.PhotosDB):
                 continue
 
             try:
-                filename  = f"{target_date.strftime('%Y%m%d')}_{i:03d}.jpg"
+                filename = f"{target_date.strftime('%Y%m%d')}_{i:03d}.jpg"
                 att_id, att_url = upload_image(resized, filename)
-                blocks.append(gallery_block(att_id, att_url))
+                # Save state immediately after each successful upload
+                state["photos"][uuid] = {"id": att_id, "url": att_url}
+                save_state(target_date, state)
                 print(f"  ✓  id={att_id}")
             except requests.HTTPError as e:
                 print(f"  ✗ upload failed: {e.response.status_code} {e.response.text[:120]}")
             finally:
                 os.unlink(resized)
 
+    # Build blocks in original photo order (preserves chronological sort)
+    uuid_to_entry = state["photos"]
+    blocks = []
+    for photo in photos:
+        entry = uuid_to_entry.get(photo.uuid)
+        if entry:
+            blocks.append(gallery_block(entry["id"], entry["url"]))
+
     if not blocks:
         print("  No images uploaded — skipping post creation.")
         return
 
     try:
-        post_id, edit_url = create_draft(blocks, target_date)
-        print(f"\n  Draft created with {len(blocks)} image(s)")
+        if state["post_id"]:
+            edit_url = update_draft(state["post_id"], blocks)
+            print(f"\n  Draft updated ({len(blocks)} image(s))")
+        else:
+            post_id, edit_url = create_draft(blocks, target_date)
+            state["post_id"] = post_id
+            save_state(target_date, state)
+            print(f"\n  Draft created ({len(blocks)} image(s))")
         print(f"  Edit here: {edit_url}")
     except requests.HTTPError as e:
         print(f"  ✗ post creation failed: {e.response.status_code} {e.response.text[:200]}")
