@@ -5,6 +5,7 @@ blogpics.py — Pull Apple Photos for a date and create a WordPress draft post.
 Usage:
     python blogpics.py 2026-04-04                   # single day
     python blogpics.py 2026-04-01 2026-04-05        # inclusive date range
+    python blogpics.py --force 2026-04-04           # delete & recreate from scratch
 
 Photos are inserted in chronological order (earliest first).
 Each photo gets its own Gutenberg gallery block.
@@ -95,6 +96,15 @@ def upload_image(file_path: str, filename: str) -> tuple[int, str]:
     return data["id"], data["source_url"]
 
 
+def delete_post(post_id: int):
+    """Move a post to trash."""
+    resp = requests.delete(
+        f"{WP_BASE}/wp-json/wp/v2/posts/{post_id}",
+        headers=auth_headers(),
+    )
+    resp.raise_for_status()
+
+
 def create_draft(blocks: list[str], post_date: date) -> tuple[int, str]:
     """Create a new draft post. Returns (post_id, edit_url)."""
     date_str = datetime(post_date.year, post_date.month, post_date.day, 12, 0, 0).strftime(
@@ -168,14 +178,26 @@ def resize_and_save(src_path: str) -> str:
 IMAGE_EXTS = {".jpg", ".jpeg", ".heic", ".png", ".tiff", ".tif"}
 
 
-def process_day(target_date: date, photosdb: osxphotos.PhotosDB):
+def process_day(target_date: date, photosdb: osxphotos.PhotosDB, force: bool = False):
     print(f"\n{'='*52}")
     print(f"  {target_date.strftime('%Y-%m-%d')}")
     print(f"{'='*52}")
 
     state = load_state(target_date)
+
+    if force:
+        if state["post_id"]:
+            print(f"  Deleting existing draft (post {state['post_id']})…")
+            try:
+                delete_post(state["post_id"])
+            except requests.HTTPError as e:
+                print(f"  ✗ could not delete post: {e.response.status_code}")
+        state = {"post_id": None, "photos": {}}
+        save_state(target_date, state)
+        print("  State cleared — uploading all photos fresh")
+
     already_done = state["photos"]
-    if already_done:
+    if already_done and not force:
         print(f"  Resuming — {len(already_done)} photo(s) already uploaded")
 
     start  = datetime(target_date.year, target_date.month, target_date.day,  0,  0,  0)
@@ -276,6 +298,9 @@ def main():
         print(__doc__)
         sys.exit(1)
 
+    force = "--force" in args
+    args  = [a for a in args if a != "--force"]
+
     try:
         start_date = datetime.strptime(args[0], "%Y-%m-%d").date()
         end_date   = datetime.strptime(args[1], "%Y-%m-%d").date() if len(args) > 1 else start_date
@@ -292,7 +317,7 @@ def main():
 
     current = start_date
     while current <= end_date:
-        process_day(current, photosdb)
+        process_day(current, photosdb, force=force)
         current += timedelta(days=1)
 
     print("\nAll done.")
