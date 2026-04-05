@@ -110,8 +110,9 @@ def create_draft(blocks: list[str], post_date: date) -> tuple[int, str]:
     date_str = datetime(post_date.year, post_date.month, post_date.day, 12, 0, 0).strftime(
         "%Y-%m-%dT%H:%M:%S"
     )
+    day_name = datetime(post_date.year, post_date.month, post_date.day).strftime("%A")
     payload = {
-        "title":   "",
+        "title":   f"{day_name} night -",
         "content": "\n\n".join(blocks),
         "status":  "draft",
         "date":    date_str,
