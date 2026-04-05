@@ -136,7 +136,7 @@ def process_day(target_date: date, photosdb: osxphotos.PhotosDB):
     start  = datetime(target_date.year, target_date.month, target_date.day,  0,  0,  0)
     end    = datetime(target_date.year, target_date.month, target_date.day, 23, 59, 59)
     photos = photosdb.photos(from_date=start, to_date=end)
-    photos = [p for p in photos if not p.hidden and not p.intrash]
+    photos = [p for p in photos if not p.hidden and not p.intrash and not p.ismovie]
     photos.sort(key=lambda p: p.date)   # chronological — earliest first
 
     if not photos:
@@ -152,13 +152,20 @@ def process_day(target_date: date, photosdb: osxphotos.PhotosDB):
             print(f"  [{i:>3}/{len(photos)}] {photo.original_filename}  ({time_str})", end="", flush=True)
 
             try:
-                exported = photo.export(tmpdir, overwrite=True, use_photos_export=True)
+                exported = photo.export(tmpdir, overwrite=True, use_photos_export=False)
             except Exception as e:
                 print(f"  ✗ export failed: {e}")
                 continue
 
             if not exported:
                 print("  ✗ nothing exported (possibly still in iCloud — download it first)")
+                continue
+
+            # skip any non-image files (e.g. .mov from live photos)
+            image_exts = {".jpg", ".jpeg", ".heic", ".png", ".tiff", ".tif"}
+            exported = [f for f in exported if Path(f).suffix.lower() in image_exts]
+            if not exported:
+                print("  ✗ no image file in export (skipped)")
                 continue
 
             try:
