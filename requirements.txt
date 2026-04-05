@@ -1,0 +1,5 @@
+osxphotos
+Pillow
+pillow-heif
+requests
+python-dotenv
