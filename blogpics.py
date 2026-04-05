@@ -126,8 +126,8 @@ def update_draft(post_id: int, blocks: list[str]) -> str:
 def gallery_block(attachment_id: int, image_url: str) -> str:
     """One Gutenberg gallery block containing a single image."""
     inner = (
-        f'<!-- wp:image {{"id":{attachment_id},"sizeSlug":"large","linkDestination":"none"}} -->\n'
-        f'<figure class="wp-block-image size-large">'
+        f'<!-- wp:image {{"id":{attachment_id},"sizeSlug":"medium_large","linkDestination":"none"}} -->\n'
+        f'<figure class="wp-block-image size-medium_large">'
         f'<img src="{image_url}" alt="" class="wp-image-{attachment_id}"/>'
         f'</figure>\n'
         f'<!-- /wp:image -->'
@@ -204,12 +204,16 @@ def process_day(target_date: date, photosdb: osxphotos.PhotosDB):
 
             try:
                 exported = photo.export(tmpdir, overwrite=True, use_photos_export=False)
+                if not exported:
+                    # File not local — ask Photos app to download from iCloud
+                    print("  (fetching from iCloud…)", end="", flush=True)
+                    exported = photo.export(tmpdir, overwrite=True, use_photos_export=True)
             except Exception as e:
                 print(f"  ✗ export failed: {e}")
                 continue
 
             if not exported:
-                print("  ✗ nothing exported (possibly still in iCloud — download it first)")
+                print("  ✗ could not retrieve (skipped)")
                 continue
 
             exported = [f for f in exported if Path(f).suffix.lower() in IMAGE_EXTS]
