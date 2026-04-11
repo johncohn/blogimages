@@ -33,8 +33,17 @@ venv/bin/python blogpics.py 2026-04-04
 # Date range (one post per day)
 venv/bin/python blogpics.py 2026-04-01 2026-04-05
 
+# Catch up from last processed date through today
+venv/bin/python blogpics.py --today
+
+# Catch up from last processed date through a specific date
+venv/bin/python blogpics.py --catchup 2026-04-10
+
 # Force rebuild — deletes existing draft and re-uploads everything
 venv/bin/python blogpics.py --force 2026-04-04
+
+# Flags can be combined
+venv/bin/python blogpics.py --force --catchup 2026-04-10
 ```
 
 ## Restartable

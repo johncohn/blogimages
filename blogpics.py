@@ -6,6 +6,8 @@ Usage:
     python blogpics.py 2026-04-04                   # single day
     python blogpics.py 2026-04-01 2026-04-05        # inclusive date range
     python blogpics.py --force 2026-04-04           # delete & recreate from scratch
+    python blogpics.py --catchup 2026-04-10         # process from last uploaded date up to given date
+    python blogpics.py --today                      # process from last uploaded date up to today
 
 Photos are inserted in chronological order (earliest first).
 Each photo gets its own Gutenberg gallery block.
@@ -311,6 +313,22 @@ def process_day(target_date: date, photosdb: osxphotos.PhotosDB, force: bool = F
     return {"date": target_date, "uploaded": len(uploaded), "skipped": len(skipped), "failed": failed, "post_id": state["post_id"]}
 
 
+def find_last_processed_date() -> date | None:
+    """Return the most recent date that has a completed state file (post_id set)."""
+    if not STATE_DIR.exists():
+        return None
+    candidates = []
+    for f in STATE_DIR.glob("*.json"):
+        try:
+            d = datetime.strptime(f.stem, "%Y-%m-%d").date()
+            state = json.loads(f.read_text())
+            if state.get("post_id"):
+                candidates.append(d)
+        except Exception:
+            continue
+    return max(candidates) if candidates else None
+
+
 def main():
     if not WP_USER or not WP_PASS:
         print("Error: WP_USER and WP_APP_PASSWORD must be set in your .env file.")
@@ -322,19 +340,43 @@ def main():
         print(__doc__)
         sys.exit(1)
 
-    force = "--force" in args
-    args  = [a for a in args if a != "--force"]
+    force   = "--force"   in args
+    catchup = "--catchup" in args
+    today   = "--today"   in args
+    args    = [a for a in args if a not in ("--force", "--catchup", "--today")]
 
-    try:
-        start_date = datetime.strptime(args[0], "%Y-%m-%d").date()
-        end_date   = datetime.strptime(args[1], "%Y-%m-%d").date() if len(args) > 1 else start_date
-    except ValueError:
-        print("Date format must be YYYY-MM-DD")
-        sys.exit(1)
+    if today or catchup:
+        last = find_last_processed_date()
+        if not last:
+            print("Error: no previously processed dates found in state/. Run a specific date first.")
+            sys.exit(1)
+        start_date = last + timedelta(days=1)
+        if today:
+            end_date = date.today()
+        else:
+            if not args:
+                print("Error: --catchup requires a date, e.g. --catchup 2026-04-10")
+                sys.exit(1)
+            try:
+                end_date = datetime.strptime(args[0], "%Y-%m-%d").date()
+            except ValueError:
+                print("Date format must be YYYY-MM-DD")
+                sys.exit(1)
+        if start_date > end_date:
+            print(f"Already up to date — last processed date was {last}.")
+            sys.exit(0)
+        print(f"Catching up from {start_date} to {end_date} (last processed: {last})")
+    else:
+        try:
+            start_date = datetime.strptime(args[0], "%Y-%m-%d").date()
+            end_date   = datetime.strptime(args[1], "%Y-%m-%d").date() if len(args) > 1 else start_date
+        except (ValueError, IndexError):
+            print("Date format must be YYYY-MM-DD")
+            sys.exit(1)
 
-    if start_date > end_date:
-        print("Start date must be on or before end date.")
-        sys.exit(1)
+        if start_date > end_date:
+            print("Start date must be on or before end date.")
+            sys.exit(1)
 
     print("Loading Photos library (this may take a moment)…")
     photosdb = osxphotos.PhotosDB()
